@@ -14,6 +14,7 @@ import importlib.util
 import time
 import subprocess
 import traceback
+from collections import Counter
 from typing import Any, Dict, List
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,6 +118,33 @@ def write_module_file(name: str, code: str) -> str:
     return fname
 
 
+def remove_module_file(fname: str) -> None:
+    path = os.path.join(MODULES_DIR, fname)
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            append_history({"event": "module_remove_error", "module": fname, "error": str(e)})
+
+
+def format_history_counter(hist_list: List[Dict[str, Any]]) -> str:
+    counter = Counter(h.get("event", "inconnu") for h in hist_list)
+    if not counter:
+        return "aucun événement notable"
+    return ", ".join(f"{evt}:{count}" for evt, count in counter.most_common())
+
+
+def build_history_text(hist_list: List[Dict[str, Any]]) -> str:
+    if not hist_list:
+        return "aucun historique."
+    return "\n".join(
+        f"- {h.get('event')}"
+        + (f" (module={h.get('module')})" if h.get("module") else "")
+        + (f" :: {h.get('error')}" if h.get("error") else "")
+        for h in hist_list
+    )
+
+
 # -------------------------
 # chargement dynamique
 # -------------------------
@@ -142,7 +170,7 @@ def load_all_modules(ctx: Dict[str, Any]) -> List[str]:
 
             # le module peut s'enregistrer pour les ticks
             if hasattr(mod, "tick") and callable(mod.tick):
-                ctx.setdefault("tickers", []).append(mod.tick)
+                ctx.setdefault("tickers", []).append({"module": fname, "tick": mod.tick})
 
             loaded.append(fname)
         except Exception as e:
@@ -152,18 +180,142 @@ def load_all_modules(ctx: Dict[str, Any]) -> List[str]:
 
 
 def run_tickers(ctx: Dict[str, Any]) -> None:
-    for t in ctx.get("tickers", []):
+    tickers = list(ctx.get("tickers", []))
+    for entry in tickers:
+        module_file = None
+        tick_fn = None
+        if isinstance(entry, dict):
+            module_file = entry.get("module")
+            tick_fn = entry.get("tick")
+        elif isinstance(entry, tuple) and len(entry) == 2:
+            module_file, tick_fn = entry
+        elif callable(entry):
+            tick_fn = entry
+        if not callable(tick_fn):
+            continue
         try:
-            t(ctx)
+            tick_fn(ctx)
         except Exception as e:
-            append_history({"event": "module_tick_error", "error": str(e)})
+            error_text = "".join(traceback.format_exception_only(type(e), e)).strip() or str(e)
+            append_history(
+                {
+                    "event": "module_tick_error",
+                    "module": module_file,
+                    "error": error_text,
+                }
+            )
+            if module_file:
+                cleanup_after_failure(module_file, error_text, ctx)
+            # désactive le ticker fautif pour ce run
+            try:
+                ctx.get("tickers", []).remove(entry)
+            except ValueError:
+                pass
+
+
+def lookup_module_public_name(module_file: str, history: List[Dict[str, Any]]) -> str:
+    for entry in reversed(history):
+        if entry.get("event") == "module_written" and entry.get("file") == module_file:
+            return entry.get("name") or module_file
+    return module_file
+
+
+def build_quick_summary(manifest: List[Dict[str, Any]], hist_list: List[Dict[str, Any]]) -> str:
+    manifest_names = ", ".join(m.get("name", "?") for m in manifest) or "aucun module"
+    hist_summary = format_history_counter(hist_list)
+    return (
+        f"- Modules actifs (fichiers) : {manifest_names}\n"
+        f"- Comptage des événements récents : {hist_summary}"
+    )
+
+
+def cleanup_after_failure(module_file: str, error_text: str, ctx: Dict[str, Any]) -> None:
+    remove_module_file(module_file)
+    append_history({"event": "module_removed_after_error", "module": module_file})
+    regenerate_failed_module(module_file, error_text, ctx)
+
+
+def regenerate_failed_module(module_file: str, error_text: str, ctx: Dict[str, Any]) -> None:
+    call_llm = ctx.get("call_llm")
+    write_module = ctx.get("write_module")
+    if not (call_llm and write_module):
+        return
+
+    hist_list = read_history_tail(60)
+    public_name = lookup_module_public_name(module_file, hist_list)
+    manifest = build_manifest()
+    hist_txt = build_history_text(hist_list)
+    quick_summary = build_quick_summary(manifest, hist_list)
+
+    prompt = f"""
+Un module a échoué et a été supprimé.
+Nom public connu : {public_name}
+Fichier supprimé : {module_file}
+Erreur rencontrée : {error_text}
+
+Synthèse rapide :
+{quick_summary}
+
+Historique récent :
+{hist_txt}
+
+Ta mission : proposer un module de remplacement aligné sur l'objectif ultime d'évolution vers une AGI. Suis ces étapes :
+1. Analyse ce que ce module devait probablement accomplir à partir du contexte.
+2. Propose un petit module utile qui corrige ou remplace la fonctionnalité défaillante.
+3. Fournis le code Python autonome correspondant.
+
+Réponds en JSON strict avec les clés suivantes :
+{{
+  "name": "nom_du_module_sans_extension",
+  "description": "but du module",
+  "code": "CODE PYTHON COMPLET"
+}}
+
+Pas de texte autour.
+"""
+
+    out = call_llm(prompt)
+    if not out:
+        return
+    cleaned = out.strip()
+    if "```" in cleaned:
+        cleaned = cleaned.replace("```json", "").replace("```python", "").replace("```", "").strip()
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        append_history({"event": "llm_regen_parse_error", "raw": cleaned})
+        return
+
+    name = data.get("name") or public_name
+    code = data.get("code")
+    description = data.get("description")
+    if description:
+        append_history({"event": "module_regen_description", "module": name, "description": description})
+    if not code:
+        append_history({"event": "llm_regen_empty_code", "module": name})
+        return
+
+    new_file = write_module(name, code)
+    append_history({"event": "module_regenerated", "from": module_file, "to": new_file})
 
 
 # -------------------------
 # phase "juge"
 # -------------------------
-def ask_llm_for_next_step(manifest: List[Dict[str, Any]], history_txt: str) -> Dict[str, Any]:
+def ask_llm_for_next_step(
+    manifest: List[Dict[str, Any]], history_txt: str, quick_summary: str
+) -> Dict[str, Any]:
     prompt = f"""
+Synthèse rapide :
+{quick_summary}
+
+But ultime explicite : faire évoluer l'agent vers une intelligence générale émergente via un écosystème modulaire auto-améliorant.
+
+Procède étape par étape :
+1. Observe l'état actuel ci-dessus.
+2. Dégage l'amélioration la plus utile pour progresser vers le but ultime.
+3. Choisis d'agir (write_module) ou de patienter (noop) selon cette analyse.
+
 Tu es le CERVEAU de l'agent.
 Ton rôle N'EST PAS d'écrire le gros programme, mais de décider s'il faut ajouter UN PETIT module Python autonome.
 
@@ -176,7 +328,7 @@ Historique récent :
 Objectif global de l'agent :
 - apprendre en ajoutant de petits modules
 - que ces modules puissent s'initialiser (init(ctx)) et agir à chaque tick (tick(ctx))
-- converger vers un système qui se réécrit et utilise ses propres capacités
+- converger vers un système qui se réécrit, utilise ses propres capacités et progresse vers l'AGI visée
 
 Règles IMPORTANTES :
 1. Tu NE réécris PAS l'agent principal.
@@ -279,9 +431,10 @@ def main() -> None:
     # noyau lui-même peut aussi demander au LLM d'ajouter un module
     manifest = build_manifest()
     hist_list = read_history_tail(30)
-    hist_txt = "\n".join(f"- {h.get('event')}" for h in hist_list) or "aucun historique."
+    hist_txt = build_history_text(hist_list)
+    quick_summary = build_quick_summary(manifest, hist_list)
 
-    decision = ask_llm_for_next_step(manifest, hist_txt)
+    decision = ask_llm_for_next_step(manifest, hist_txt, quick_summary)
     if decision.get("action") != "write_module":
         append_history({"event": "llm_decision_noop"})
         return

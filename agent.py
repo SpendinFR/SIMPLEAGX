@@ -15,6 +15,7 @@ import time
 import subprocess
 import traceback
 from collections import Counter
+import ast
 from typing import Any, Dict, List
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -88,6 +89,47 @@ def call_llm(prompt: str) -> str:
 # -------------------------
 # MANIFEST
 # -------------------------
+def _truncate(text: str, limit: int = 240) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _extract_module_metadata(path: str) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "summary": "",
+        "has_init": False,
+        "has_tick": False,
+        "functions": [],
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+        doc = ast.get_docstring(tree) or ""
+        func_names: List[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                func_names.append(node.name)
+                if node.name == "init":
+                    meta["has_init"] = True
+                if node.name == "tick":
+                    meta["has_tick"] = True
+        summary_parts: List[str] = []
+        if doc:
+            summary_parts.append(_truncate(doc.strip().replace("\n", " ")))
+        if func_names:
+            summary_parts.append(f"fonctions: {', '.join(func_names)}")
+        if not summary_parts and source:
+            first_lines = " ".join(line.strip() for line in source.splitlines()[:5])
+            summary_parts.append(_truncate(first_lines))
+        meta["summary"] = " | ".join(summary_parts)
+        meta["functions"] = func_names
+    except Exception as e:
+        meta["summary"] = f"analyse impossible: {e}"[:240]
+    return meta
+
+
 def build_manifest() -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     if not os.path.isdir(MODULES_DIR):
@@ -100,7 +142,16 @@ def build_manifest() -> List[Dict[str, Any]]:
             size = os.path.getsize(path)
         except Exception:
             size = 0
-        items.append({"name": fname, "size": size})
+        meta = _extract_module_metadata(path)
+        items.append(
+            {
+                "name": fname,
+                "size": size,
+                "has_init": meta["has_init"],
+                "has_tick": meta["has_tick"],
+                "summary": meta["summary"],
+            }
+        )
     return items
 
 
@@ -134,6 +185,19 @@ def format_history_counter(hist_list: List[Dict[str, Any]]) -> str:
     return ", ".join(f"{evt}:{count}" for evt, count in counter.most_common())
 
 
+def build_progress_metrics(hist_list: List[Dict[str, Any]]) -> str:
+    if not hist_list:
+        return "aucune donnée de progression"
+    counter = Counter(h.get("event", "inconnu") for h in hist_list)
+    tick_errors = counter.get("module_tick_error", 0)
+    regen = counter.get("module_regenerated", 0)
+    written = counter.get("module_written", 0)
+    removed = counter.get("module_removed_after_error", 0)
+    return (
+        f"modules écrits:{written} | régénérés:{regen} | erreurs tick:{tick_errors} | suppressions:{removed}"
+    )
+
+
 def build_history_text(hist_list: List[Dict[str, Any]]) -> str:
     if not hist_list:
         return "aucun historique."
@@ -143,6 +207,44 @@ def build_history_text(hist_list: List[Dict[str, Any]]) -> str:
         + (f" :: {h.get('error')}" if h.get("error") else "")
         for h in hist_list
     )
+
+
+def describe_history_event(event: Dict[str, Any]) -> str:
+    evt = event.get("event", "inconnu")
+    if evt == "module_written":
+        name = event.get("name") or event.get("file") or "module"
+        return f"module ajouté : {name}"
+    if evt == "module_regenerated":
+        return f"module régénéré : {event.get('from')} → {event.get('to')}"
+    if evt == "module_removed_after_error":
+        return f"module supprimé après erreur : {event.get('module')}"
+    if evt == "module_tick_error":
+        module = event.get("module") or "module inconnu"
+        error = (event.get("error") or "").splitlines()[0][:120]
+        return f"erreur tick sur {module} :: {error}".strip()
+    if evt == "modules_loaded":
+        modules = event.get("modules") or []
+        return f"modules chargés : {', '.join(modules) or 'aucun'}"
+    if evt == "module_regen_description":
+        return f"objectif régénération : {event.get('description')}"
+    if evt == "llm_decision_noop":
+        return "décision : noop"
+    if evt == "llm_empty_module":
+        return f"échec génération (code vide) pour {event.get('name')}"
+    if evt == "module_load_error":
+        module = event.get("module") or "module"
+        error = (event.get("error") or "").splitlines()[0][:120]
+        return f"erreur chargement {module} :: {error}".strip()
+    return evt
+
+
+def build_recent_activity_summary(hist_list: List[Dict[str, Any]], limit: int = 8) -> str:
+    if not hist_list:
+        return "  - aucune activité enregistrée"
+    lines: List[str] = []
+    for event in reversed(hist_list[-limit:]):
+        lines.append(f"  - {describe_history_event(event)}")
+    return "\n".join(lines)
 
 
 # -------------------------
@@ -221,11 +323,20 @@ def lookup_module_public_name(module_file: str, history: List[Dict[str, Any]]) -
 
 
 def build_quick_summary(manifest: List[Dict[str, Any]], hist_list: List[Dict[str, Any]]) -> str:
-    manifest_names = ", ".join(m.get("name", "?") for m in manifest) or "aucun module"
+    manifest_lines = []
+    for m in manifest:
+        manifest_lines.append(
+            f"  - {m.get('name')} | taille={m.get('size')} | init={m.get('has_init')} | tick={m.get('has_tick')} | {m.get('summary')}"
+        )
+    manifest_block = "\n".join(manifest_lines) or "  - aucun module"
     hist_summary = format_history_counter(hist_list)
+    progress_line = build_progress_metrics(hist_list)
+    activity_block = build_recent_activity_summary(hist_list)
     return (
-        f"- Modules actifs (fichiers) : {manifest_names}\n"
-        f"- Comptage des événements récents : {hist_summary}"
+        f"- Modules actifs détaillés :\n{manifest_block}\n"
+        f"- Comptage des événements récents (sur {len(hist_list)} entrées) : {hist_summary}\n"
+        f"- Indicateurs de progression : {progress_line}\n"
+        f"- Activités notables :\n{activity_block}"
     )
 
 
@@ -310,6 +421,8 @@ Synthèse rapide :
 {quick_summary}
 
 But ultime explicite : faire évoluer l'agent vers une intelligence générale émergente via un écosystème modulaire auto-améliorant.
+
+Tu disposes d'un LLM puissant : exploite-le pour orchestrer la progression.
 
 Procède étape par étape :
 1. Observe l'état actuel ci-dessus.

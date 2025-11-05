@@ -16,6 +16,7 @@ import subprocess
 import traceback
 from collections import Counter
 import ast
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,6 +98,9 @@ def _truncate(text: str, limit: int = 240) -> str:
     return text[: limit - 3] + "..."
 
 
+_CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+
+
 def _parse_json_response(raw: str) -> Tuple[Optional[Any], Optional[str]]:
     """Try to decode JSON even if text surrounds it."""
 
@@ -117,6 +121,42 @@ def _parse_json_response(raw: str) -> Tuple[Optional[Any], Optional[str]]:
             except json.JSONDecodeError:
                 continue
         return None, f"JSON invalide: {first_error.msg} (ligne {first_error.lineno}, colonne {first_error.colno})"
+
+
+def _normalize_module_code(raw: str) -> str:
+    """Extraire le code Python d'une réponse possiblement verbeuse."""
+
+    if not raw:
+        return ""
+
+    text = raw.strip()
+    if not text:
+        return ""
+
+    matches = _CODE_FENCE_RE.findall(text)
+    if matches:
+        segments = [segment.strip() for segment in matches if segment.strip()]
+        if segments:
+            return "\n\n".join(segments)
+
+    if "```" in text:
+        text = text.replace("```python", "").replace("```", "").strip()
+
+    lines = text.splitlines()
+    valid_prefixes = ("def ", "class ", "import ", "from ", "@", "#", '"""', "'''")
+    start_idx: Optional[int] = None
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        if stripped.startswith(valid_prefixes) or stripped[0].isalnum():
+            start_idx = idx
+            break
+
+    if start_idx is not None and start_idx > 0:
+        text = "\n".join(lines[start_idx:]).strip()
+
+    return text
 
 
 def _extract_module_metadata(path: str) -> Dict[str, Any]:
@@ -393,17 +433,17 @@ def generate_valid_module_code(
 ) -> Optional[str]:
     attempts = 0
     validation_error: Optional[str] = None
-    last_code = initial_code or ""
+    last_code = _normalize_module_code(initial_code or "") if initial_code else ""
     use_initial = initial_code is not None
 
     while attempts < 3:
         if use_initial:
-            candidate = initial_code or ""
+            candidate_raw = initial_code or ""
             use_initial = False
         elif attempts == 0:
-            candidate = ask_llm_for_module_code(name, description, manifest, history_txt)
+            candidate_raw = ask_llm_for_module_code(name, description, manifest, history_txt)
         else:
-            candidate = ask_llm_to_fix_module_code(
+            candidate_raw = ask_llm_to_fix_module_code(
                 name,
                 description,
                 manifest,
@@ -412,6 +452,8 @@ def generate_valid_module_code(
                 validation_error or "erreur inconnue",
             )
 
+        candidate = _normalize_module_code(candidate_raw)
+
         if not candidate.strip():
             append_history(
                 {
@@ -419,9 +461,13 @@ def generate_valid_module_code(
                     "name": name,
                     "attempt": attempts + 1,
                     "context": context,
+                    "reason": "nettoyage_sans_code",  # indique que la réponse ne contenait pas de code utilisable
                 }
             )
-            return None
+            validation_error = "code vide après nettoyage"
+            attempts += 1
+            last_code = candidate
+            continue
 
         validation_error = validate_module_code(candidate)
         if not validation_error:
@@ -434,6 +480,7 @@ def generate_valid_module_code(
                 "error": validation_error,
                 "attempt": attempts + 1,
                 "context": context,
+                "preview": _truncate(candidate, 160),
             }
         )
 
@@ -446,6 +493,7 @@ def generate_valid_module_code(
             "name": name,
             "error": validation_error,
             "context": context,
+            "preview": _truncate(last_code, 160),
         }
     )
     return None

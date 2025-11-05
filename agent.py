@@ -367,25 +367,30 @@ def generate_valid_module_code(
     history_txt: str,
     *,
     context: str,
+    initial_code: Optional[str] = None,
 ) -> Optional[str]:
     attempts = 0
-    code = ""
     validation_error: Optional[str] = None
+    last_code = initial_code or ""
+    use_initial = initial_code is not None
 
     while attempts < 3:
-        if attempts == 0:
-            code = ask_llm_for_module_code(name, description, manifest, history_txt)
+        if use_initial:
+            candidate = initial_code or ""
+            use_initial = False
+        elif attempts == 0:
+            candidate = ask_llm_for_module_code(name, description, manifest, history_txt)
         else:
-            code = ask_llm_to_fix_module_code(
+            candidate = ask_llm_to_fix_module_code(
                 name,
                 description,
                 manifest,
                 history_txt,
-                code,
+                last_code,
                 validation_error or "erreur inconnue",
             )
 
-        if not code.strip():
+        if not candidate.strip():
             append_history(
                 {
                     "event": "llm_empty_module",
@@ -396,9 +401,9 @@ def generate_valid_module_code(
             )
             return None
 
-        validation_error = validate_module_code(code)
+        validation_error = validate_module_code(candidate)
         if not validation_error:
-            return code
+            return candidate
 
         append_history(
             {
@@ -409,7 +414,9 @@ def generate_valid_module_code(
                 "context": context,
             }
         )
+
         attempts += 1
+        last_code = candidate
 
     append_history(
         {
@@ -488,6 +495,7 @@ Pas de texte autour.
         manifest,
         hist_txt,
         context="regen",
+        initial_code=code,
     )
     if not valid_code:
         return

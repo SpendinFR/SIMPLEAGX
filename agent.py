@@ -16,7 +16,7 @@ import subprocess
 import traceback
 from collections import Counter
 import ast
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEM_DIR = os.path.join(BASE_DIR, "mem")
@@ -95,6 +95,28 @@ def _truncate(text: str, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _parse_json_response(raw: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Try to decode JSON even if text surrounds it."""
+
+    cleaned = raw.strip()
+    if not cleaned:
+        return None, "réponse vide"
+
+    decoder = json.JSONDecoder()
+    try:
+        return decoder.decode(cleaned), None
+    except json.JSONDecodeError as first_error:
+        for idx, ch in enumerate(cleaned):
+            if ch not in "[{":
+                continue
+            try:
+                data, _ = decoder.raw_decode(cleaned[idx:])
+                return data, None
+            except json.JSONDecodeError:
+                continue
+        return None, f"JSON invalide: {first_error.msg} (ligne {first_error.lineno}, colonne {first_error.colno})"
 
 
 def _extract_module_metadata(path: str) -> Dict[str, Any]:
@@ -474,10 +496,15 @@ Pas de texte autour.
     cleaned = out.strip()
     if "```" in cleaned:
         cleaned = cleaned.replace("```json", "").replace("```python", "").replace("```", "").strip()
-    try:
-        data = json.loads(cleaned)
-    except Exception:
-        append_history({"event": "llm_regen_parse_error", "raw": cleaned})
+    data, parse_error = _parse_json_response(cleaned)
+    if data is None:
+        append_history(
+            {
+                "event": "llm_regen_parse_error",
+                "raw": cleaned,
+                "error": parse_error,
+            }
+        )
         return
 
     name = data.get("name") or public_name
@@ -576,11 +603,18 @@ RENVOIE UNIQUEMENT le JSON, pas de commentaire.
     out = out.strip()
     if "```" in out:
         out = out.replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(out)
-    except Exception as e:
-        append_history({"event": "llm_json_parse_error", "raw": out, "error": str(e)})
-        return {"action": "noop"}
+    data, parse_error = _parse_json_response(out)
+    if data is not None:
+        return data
+
+    append_history(
+        {
+            "event": "llm_json_parse_error",
+            "raw": out,
+            "error": parse_error,
+        }
+    )
+    return {"action": "noop"}
 
 
 def ask_llm_for_module_code(

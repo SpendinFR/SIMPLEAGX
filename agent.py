@@ -103,6 +103,7 @@ def _truncate(text: str, limit: int = 240) -> str:
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;?]*[A-Za-z]")
 _PY_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+")
+_JSON_CODE_FIELD_RE = re.compile(r'"code"\s*:\s*"(?P<code>(?:\\.|[^"\\])*)"')
 _SPINNER_FRAMES = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 
@@ -162,6 +163,67 @@ def _normalize_module_code(raw: str) -> str:
         text = "\n".join(lines[start_idx:]).strip()
 
     return text
+
+
+def _extract_code_candidate(raw: str, name: str, context: str, stage: str) -> str:
+    """Récupère le champ code depuis une réponse JSON, sinon renvoie la réponse brute."""
+
+    if not raw:
+        return ""
+
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+
+    data, parse_error = _parse_json_response(cleaned)
+    if isinstance(data, dict):
+        code_value = data.get("code")
+        if isinstance(code_value, str):
+            return code_value
+
+        append_history(
+            {
+                "event": "llm_module_json_error",
+                "name": name,
+                "context": context,
+                "stage": stage,
+                "error": "champ 'code' manquant ou non textuel",
+                "raw": _truncate(cleaned, 200),
+            }
+        )
+        return cleaned
+
+    if parse_error:
+        match = _JSON_CODE_FIELD_RE.search(cleaned)
+        if match:
+            raw_code = match.group("code")
+            try:
+                recovered = json.loads(f'"{raw_code}"')
+            except json.JSONDecodeError:
+                recovered = raw_code.replace("\\n", "\n")
+            append_history(
+                {
+                    "event": "llm_module_json_recovered",
+                    "name": name,
+                    "context": context,
+                    "stage": stage,
+                    "raw": _truncate(cleaned, 200),
+                }
+            )
+            return recovered
+
+        append_history(
+            {
+                "event": "llm_module_json_error",
+                "name": name,
+                "context": context,
+                "stage": stage,
+                "error": parse_error,
+                "raw": _truncate(cleaned, 200),
+            }
+        )
+
+    return cleaned
 
 
 def _clean_llm_stderr(raw: str) -> str:
@@ -460,9 +522,11 @@ def generate_valid_module_code(
     while attempts < 3:
         if use_initial:
             candidate_raw = initial_code or ""
+            stage = "initial_seed"
             use_initial = False
         elif attempts == 0:
             candidate_raw = ask_llm_for_module_code(name, description, manifest, history_txt)
+            stage = "initial_prompt"
         else:
             candidate_raw = ask_llm_to_fix_module_code(
                 name,
@@ -472,8 +536,14 @@ def generate_valid_module_code(
                 last_code,
                 validation_error or "erreur inconnue",
             )
+            stage = "fix_prompt"
 
-        candidate = _normalize_module_code(candidate_raw)
+        if stage == "initial_seed":
+            candidate = _normalize_module_code(candidate_raw)
+        else:
+            candidate = _normalize_module_code(
+                _extract_code_candidate(candidate_raw, name, context, stage)
+            )
 
         if not candidate.strip():
             append_history(
@@ -706,7 +776,45 @@ Contraintes:
 - si besoin: def tick(ctx): ...
 - chaque fonction doit contenir un corps valide (au minimum "pass")
 - n'appelle pas init(ctx) ou tick(ctx) au niveau global
-- PAS de texte autour, renvoie UNIQUEMENT le code Python.
+- renvoie UNIQUEMENT un JSON de la forme {{"code": "..."}}
+- encode les retours à la ligne avec \n dans la valeur de "code"
+- pas d'autres champs ni commentaires.
+"""
+    code = call_llm(prompt)
+    if not code:
+        return ""
+    if "```" in code:
+        code = code.replace("```python", "").replace("```", "").strip()
+    return code
+
+
+def ask_llm_to_fix_module_code(
+    name: str,
+    description: str,
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    previous_code: str,
+    error_message: str,
+) -> str:
+    prompt = f"""
+Le code suivant pour le module {name} provoque une erreur de validation :
+---
+{previous_code}
+---
+Erreur détectée : {error_message}
+
+Réécris le module complet en corrigeant le problème tout en respectant la description :
+{description}
+
+Rappels :
+- le module doit pouvoir être importé sans erreur
+- si besoin: def init(ctx): ...
+- si besoin: def tick(ctx): ...
+- chaque fonction doit contenir un corps valide (au minimum "pass")
+- n'appelle pas init(ctx) ou tick(ctx) au niveau global
+- renvoie UNIQUEMENT un JSON de la forme {{"code": "..."}}
+- encode les retours à la ligne avec \n dans la valeur de "code"
+- pas d'autres champs ni commentaires.
 """
     code = call_llm(prompt)
     if not code:

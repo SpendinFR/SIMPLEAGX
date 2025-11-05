@@ -16,7 +16,7 @@ import subprocess
 import traceback
 from collections import Counter
 import ast
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEM_DIR = os.path.join(BASE_DIR, "mem")
@@ -73,6 +73,8 @@ def call_llm(prompt: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         out, err = proc.communicate(prompt)
         if err:
@@ -167,6 +169,18 @@ def write_module_file(name: str, code: str) -> str:
         f.write(code)
     append_history({"event": "module_written", "file": fname, "name": name})
     return fname
+
+
+def validate_module_code(code: str) -> Optional[str]:
+    """Return an error message if the code is not valid Python."""
+    try:
+        compile(code, "<module>", "exec")
+    except SyntaxError as e:
+        location = f" (ligne {e.lineno}, colonne {e.offset})" if e.lineno else ""
+        return f"SyntaxError{location}: {e.msg}"
+    except Exception as e:  # pragma: no cover - sécurité
+        return f"Erreur lors de la compilation: {e}"
+    return None
 
 
 def remove_module_file(fname: str) -> None:
@@ -346,6 +360,68 @@ def cleanup_after_failure(module_file: str, error_text: str, ctx: Dict[str, Any]
     regenerate_failed_module(module_file, error_text, ctx)
 
 
+def generate_valid_module_code(
+    name: str,
+    description: str,
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    *,
+    context: str,
+) -> Optional[str]:
+    attempts = 0
+    code = ""
+    validation_error: Optional[str] = None
+
+    while attempts < 3:
+        if attempts == 0:
+            code = ask_llm_for_module_code(name, description, manifest, history_txt)
+        else:
+            code = ask_llm_to_fix_module_code(
+                name,
+                description,
+                manifest,
+                history_txt,
+                code,
+                validation_error or "erreur inconnue",
+            )
+
+        if not code.strip():
+            append_history(
+                {
+                    "event": "llm_empty_module",
+                    "name": name,
+                    "attempt": attempts + 1,
+                    "context": context,
+                }
+            )
+            return None
+
+        validation_error = validate_module_code(code)
+        if not validation_error:
+            return code
+
+        append_history(
+            {
+                "event": "module_validation_error",
+                "name": name,
+                "error": validation_error,
+                "attempt": attempts + 1,
+                "context": context,
+            }
+        )
+        attempts += 1
+
+    append_history(
+        {
+            "event": "module_validation_failed",
+            "name": name,
+            "error": validation_error,
+            "context": context,
+        }
+    )
+    return None
+
+
 def regenerate_failed_module(module_file: str, error_text: str, ctx: Dict[str, Any]) -> None:
     call_llm = ctx.get("call_llm")
     write_module = ctx.get("write_module")
@@ -406,7 +482,17 @@ Pas de texte autour.
         append_history({"event": "llm_regen_empty_code", "module": name})
         return
 
-    new_file = write_module(name, code)
+    valid_code = generate_valid_module_code(
+        name,
+        description or "module utilitaire pour l'agent",
+        manifest,
+        hist_txt,
+        context="regen",
+    )
+    if not valid_code:
+        return
+
+    new_file = write_module(name, valid_code)
     append_history({"event": "module_regenerated", "from": module_file, "to": new_file})
 
 
@@ -489,7 +575,9 @@ RENVOIE UNIQUEMENT le JSON, pas de commentaire.
         return {"action": "noop"}
 
 
-def ask_llm_for_module_code(name: str, description: str, manifest: List[Dict[str, Any]], history_txt: str) -> str:
+def ask_llm_for_module_code(
+    name: str, description: str, manifest: List[Dict[str, Any]], history_txt: str
+) -> str:
     prompt = f"""
 Tu écris un module Python autonome pour un agent évolutif.
 Le module sera enregistré dans ./modules/{name}.py
@@ -505,7 +593,43 @@ Contraintes:
 - doit pouvoir être importé sans erreur
 - si besoin: def init(ctx): ...
 - si besoin: def tick(ctx): ...
+- chaque fonction doit contenir un corps valide (au minimum "pass")
+- n'appelle pas init(ctx) ou tick(ctx) au niveau global
 - PAS de texte autour, renvoie UNIQUEMENT le code Python.
+"""
+    code = call_llm(prompt)
+    if not code:
+        return ""
+    if "```" in code:
+        code = code.replace("```python", "").replace("```", "").strip()
+    return code
+
+
+def ask_llm_to_fix_module_code(
+    name: str,
+    description: str,
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    previous_code: str,
+    error_message: str,
+) -> str:
+    prompt = f"""
+Le code suivant pour le module {name} provoque une erreur de validation :
+---
+{previous_code}
+---
+Erreur détectée : {error_message}
+
+Réécris le module complet en corrigeant le problème tout en respectant la description :
+{description}
+
+Rappels :
+- le module doit pouvoir être importé sans erreur
+- si besoin: def init(ctx): ...
+- si besoin: def tick(ctx): ...
+- chaque fonction doit contenir un corps valide (au minimum "pass")
+- n'appelle pas init(ctx) ou tick(ctx) au niveau global
+- renvoie UNIQUEMENT le code Python, sans balise.
 """
     code = call_llm(prompt)
     if not code:
@@ -526,7 +650,6 @@ def main() -> None:
         "base_dir": BASE_DIR,
         "mem_dir": MEM_DIR,
         "modules_dir": MODULES_DIR,
-        "tickers": [],
     }
 
     # on expose les outils du noyau AUX modules
@@ -535,33 +658,40 @@ def main() -> None:
     ctx["get_manifest"] = build_manifest
     ctx["get_history"] = lambda n=80: read_history_tail(n)
 
-    loaded = load_all_modules(ctx)
-    append_history({"event": "modules_loaded", "modules": loaded})
+    try:
+        while True:
+            # les tickers sont reconstruits à chaque itération
+            ctx["tickers"] = []
 
-    # on laisse les modules jouer
-    run_tickers(ctx)
+            loaded = load_all_modules(ctx)
+            append_history({"event": "modules_loaded", "modules": loaded})
 
-    # noyau lui-même peut aussi demander au LLM d'ajouter un module
-    manifest = build_manifest()
-    hist_list = read_history_tail(30)
-    hist_txt = build_history_text(hist_list)
-    quick_summary = build_quick_summary(manifest, hist_list)
+            # on laisse les modules jouer
+            run_tickers(ctx)
 
-    decision = ask_llm_for_next_step(manifest, hist_txt, quick_summary)
-    if decision.get("action") != "write_module":
-        append_history({"event": "llm_decision_noop"})
-        return
+            # noyau lui-même peut aussi demander au LLM d'ajouter un module
+            manifest = build_manifest()
+            hist_list = read_history_tail(30)
+            hist_txt = build_history_text(hist_list)
+            quick_summary = build_quick_summary(manifest, hist_list)
 
-    mod_name = decision.get("name") or f"module_{int(time.time())}"
-    mod_desc = decision.get("description") or "module utilitaire pour l'agent"
+            decision = ask_llm_for_next_step(manifest, hist_txt, quick_summary)
+            if decision.get("action") != "write_module":
+                append_history({"event": "llm_decision_noop"})
+            else:
+                mod_name = decision.get("name") or f"module_{int(time.time())}"
+                mod_desc = decision.get("description") or "module utilitaire pour l'agent"
 
-    code = ask_llm_for_module_code(mod_name, mod_desc, manifest, hist_txt)
-    if not code.strip():
-        append_history({"event": "llm_empty_module", "name": mod_name})
-        return
+                valid_code = generate_valid_module_code(
+                    mod_name, mod_desc, manifest, hist_txt, context="initial"
+                )
+                if valid_code:
+                    fname = write_module_file(mod_name, valid_code)
+                    print(f"[agent] module ajouté: {fname}")
 
-    fname = write_module_file(mod_name, code)
-    print(f"[agent] module ajouté: {fname}")
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("[agent] arrêt demandé, au revoir")
 
 
 if __name__ == "__main__":

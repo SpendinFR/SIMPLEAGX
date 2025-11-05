@@ -16,7 +16,8 @@ import subprocess
 import traceback
 from collections import Counter
 import ast
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEM_DIR = os.path.join(BASE_DIR, "mem")
@@ -73,10 +74,14 @@ def call_llm(prompt: str) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         out, err = proc.communicate(prompt)
         if err:
-            append_history({"event": "llm_stderr", "stderr": err})
+            cleaned_err = _clean_llm_stderr(err)
+            if cleaned_err:
+                append_history({"event": "llm_stderr", "stderr": cleaned_err})
         return (out or "").strip()
     except FileNotFoundError:
         append_history({"event": "llm_error", "error": "ollama introuvable"})
@@ -93,6 +98,86 @@ def _truncate(text: str, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+_CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;?]*[A-Za-z]")
+_PY_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+")
+_SPINNER_FRAMES = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+
+def _parse_json_response(raw: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Try to decode JSON even if text surrounds it."""
+
+    cleaned = raw.strip()
+    if not cleaned:
+        return None, "réponse vide"
+
+    decoder = json.JSONDecoder()
+    try:
+        return decoder.decode(cleaned), None
+    except json.JSONDecodeError as first_error:
+        for idx, ch in enumerate(cleaned):
+            if ch not in "[{":
+                continue
+            try:
+                data, _ = decoder.raw_decode(cleaned[idx:])
+                return data, None
+            except json.JSONDecodeError:
+                continue
+        return None, f"JSON invalide: {first_error.msg} (ligne {first_error.lineno}, colonne {first_error.colno})"
+
+
+def _normalize_module_code(raw: str) -> str:
+    """Extraire le code Python d'une réponse possiblement verbeuse."""
+
+    if not raw:
+        return ""
+
+    text = raw.strip()
+    if not text:
+        return ""
+
+    matches = _CODE_FENCE_RE.findall(text)
+    if matches:
+        segments = [segment.strip() for segment in matches if segment.strip()]
+        if segments:
+            return "\n\n".join(segments)
+
+    if "```" in text:
+        text = text.replace("```python", "").replace("```", "").strip()
+
+    lines = text.splitlines()
+    valid_prefixes = ("def ", "class ", "import ", "from ", "@", "#", '"""', "'''")
+    start_idx: Optional[int] = None
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped:
+            continue
+        if stripped.startswith(valid_prefixes) or _PY_ASSIGN_RE.match(stripped):
+            start_idx = idx
+            break
+
+    if start_idx is not None and start_idx > 0:
+        text = "\n".join(lines[start_idx:]).strip()
+
+    return text
+
+
+def _clean_llm_stderr(raw: str) -> str:
+    if not raw:
+        return ""
+
+    text = _ANSI_ESCAPE_RE.sub("", raw)
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if all(ch in _SPINNER_FRAMES for ch in stripped):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
 
 
 def _extract_module_metadata(path: str) -> Dict[str, Any]:
@@ -167,6 +252,18 @@ def write_module_file(name: str, code: str) -> str:
         f.write(code)
     append_history({"event": "module_written", "file": fname, "name": name})
     return fname
+
+
+def validate_module_code(code: str) -> Optional[str]:
+    """Return an error message if the code is not valid Python."""
+    try:
+        compile(code, "<module>", "exec")
+    except SyntaxError as e:
+        location = f" (ligne {e.lineno}, colonne {e.offset})" if e.lineno else ""
+        return f"SyntaxError{location}: {e.msg}"
+    except Exception as e:  # pragma: no cover - sécurité
+        return f"Erreur lors de la compilation: {e}"
+    return None
 
 
 def remove_module_file(fname: str) -> None:
@@ -346,6 +443,83 @@ def cleanup_after_failure(module_file: str, error_text: str, ctx: Dict[str, Any]
     regenerate_failed_module(module_file, error_text, ctx)
 
 
+def generate_valid_module_code(
+    name: str,
+    description: str,
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    *,
+    context: str,
+    initial_code: Optional[str] = None,
+) -> Optional[str]:
+    attempts = 0
+    validation_error: Optional[str] = None
+    last_code = _normalize_module_code(initial_code or "") if initial_code else ""
+    use_initial = initial_code is not None
+
+    while attempts < 3:
+        if use_initial:
+            candidate_raw = initial_code or ""
+            use_initial = False
+        elif attempts == 0:
+            candidate_raw = ask_llm_for_module_code(name, description, manifest, history_txt)
+        else:
+            candidate_raw = ask_llm_to_fix_module_code(
+                name,
+                description,
+                manifest,
+                history_txt,
+                last_code,
+                validation_error or "erreur inconnue",
+            )
+
+        candidate = _normalize_module_code(candidate_raw)
+
+        if not candidate.strip():
+            append_history(
+                {
+                    "event": "llm_empty_module",
+                    "name": name,
+                    "attempt": attempts + 1,
+                    "context": context,
+                    "reason": "nettoyage_sans_code",  # indique que la réponse ne contenait pas de code utilisable
+                }
+            )
+            validation_error = "code vide après nettoyage"
+            attempts += 1
+            last_code = candidate
+            continue
+
+        validation_error = validate_module_code(candidate)
+        if not validation_error:
+            return candidate
+
+        append_history(
+            {
+                "event": "module_validation_error",
+                "name": name,
+                "error": validation_error,
+                "attempt": attempts + 1,
+                "context": context,
+                "preview": _truncate(candidate, 160),
+            }
+        )
+
+        attempts += 1
+        last_code = candidate
+
+    append_history(
+        {
+            "event": "module_validation_failed",
+            "name": name,
+            "error": validation_error,
+            "context": context,
+            "preview": _truncate(last_code, 160),
+        }
+    )
+    return None
+
+
 def regenerate_failed_module(module_file: str, error_text: str, ctx: Dict[str, Any]) -> None:
     call_llm = ctx.get("call_llm")
     write_module = ctx.get("write_module")
@@ -391,10 +565,15 @@ Pas de texte autour.
     cleaned = out.strip()
     if "```" in cleaned:
         cleaned = cleaned.replace("```json", "").replace("```python", "").replace("```", "").strip()
-    try:
-        data = json.loads(cleaned)
-    except Exception:
-        append_history({"event": "llm_regen_parse_error", "raw": cleaned})
+    data, parse_error = _parse_json_response(cleaned)
+    if data is None:
+        append_history(
+            {
+                "event": "llm_regen_parse_error",
+                "raw": cleaned,
+                "error": parse_error,
+            }
+        )
         return
 
     name = data.get("name") or public_name
@@ -406,7 +585,18 @@ Pas de texte autour.
         append_history({"event": "llm_regen_empty_code", "module": name})
         return
 
-    new_file = write_module(name, code)
+    valid_code = generate_valid_module_code(
+        name,
+        description or "module utilitaire pour l'agent",
+        manifest,
+        hist_txt,
+        context="regen",
+        initial_code=code,
+    )
+    if not valid_code:
+        return
+
+    new_file = write_module(name, valid_code)
     append_history({"event": "module_regenerated", "from": module_file, "to": new_file})
 
 
@@ -482,14 +672,23 @@ RENVOIE UNIQUEMENT le JSON, pas de commentaire.
     out = out.strip()
     if "```" in out:
         out = out.replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(out)
-    except Exception as e:
-        append_history({"event": "llm_json_parse_error", "raw": out, "error": str(e)})
-        return {"action": "noop"}
+    data, parse_error = _parse_json_response(out)
+    if data is not None:
+        return data
+
+    append_history(
+        {
+            "event": "llm_json_parse_error",
+            "raw": out,
+            "error": parse_error,
+        }
+    )
+    return {"action": "noop"}
 
 
-def ask_llm_for_module_code(name: str, description: str, manifest: List[Dict[str, Any]], history_txt: str) -> str:
+def ask_llm_for_module_code(
+    name: str, description: str, manifest: List[Dict[str, Any]], history_txt: str
+) -> str:
     prompt = f"""
 Tu écris un module Python autonome pour un agent évolutif.
 Le module sera enregistré dans ./modules/{name}.py
@@ -505,7 +704,43 @@ Contraintes:
 - doit pouvoir être importé sans erreur
 - si besoin: def init(ctx): ...
 - si besoin: def tick(ctx): ...
+- chaque fonction doit contenir un corps valide (au minimum "pass")
+- n'appelle pas init(ctx) ou tick(ctx) au niveau global
 - PAS de texte autour, renvoie UNIQUEMENT le code Python.
+"""
+    code = call_llm(prompt)
+    if not code:
+        return ""
+    if "```" in code:
+        code = code.replace("```python", "").replace("```", "").strip()
+    return code
+
+
+def ask_llm_to_fix_module_code(
+    name: str,
+    description: str,
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    previous_code: str,
+    error_message: str,
+) -> str:
+    prompt = f"""
+Le code suivant pour le module {name} provoque une erreur de validation :
+---
+{previous_code}
+---
+Erreur détectée : {error_message}
+
+Réécris le module complet en corrigeant le problème tout en respectant la description :
+{description}
+
+Rappels :
+- le module doit pouvoir être importé sans erreur
+- si besoin: def init(ctx): ...
+- si besoin: def tick(ctx): ...
+- chaque fonction doit contenir un corps valide (au minimum "pass")
+- n'appelle pas init(ctx) ou tick(ctx) au niveau global
+- renvoie UNIQUEMENT le code Python, sans balise.
 """
     code = call_llm(prompt)
     if not code:
@@ -526,7 +761,6 @@ def main() -> None:
         "base_dir": BASE_DIR,
         "mem_dir": MEM_DIR,
         "modules_dir": MODULES_DIR,
-        "tickers": [],
     }
 
     # on expose les outils du noyau AUX modules
@@ -535,33 +769,40 @@ def main() -> None:
     ctx["get_manifest"] = build_manifest
     ctx["get_history"] = lambda n=80: read_history_tail(n)
 
-    loaded = load_all_modules(ctx)
-    append_history({"event": "modules_loaded", "modules": loaded})
+    try:
+        while True:
+            # les tickers sont reconstruits à chaque itération
+            ctx["tickers"] = []
 
-    # on laisse les modules jouer
-    run_tickers(ctx)
+            loaded = load_all_modules(ctx)
+            append_history({"event": "modules_loaded", "modules": loaded})
 
-    # noyau lui-même peut aussi demander au LLM d'ajouter un module
-    manifest = build_manifest()
-    hist_list = read_history_tail(30)
-    hist_txt = build_history_text(hist_list)
-    quick_summary = build_quick_summary(manifest, hist_list)
+            # on laisse les modules jouer
+            run_tickers(ctx)
 
-    decision = ask_llm_for_next_step(manifest, hist_txt, quick_summary)
-    if decision.get("action") != "write_module":
-        append_history({"event": "llm_decision_noop"})
-        return
+            # noyau lui-même peut aussi demander au LLM d'ajouter un module
+            manifest = build_manifest()
+            hist_list = read_history_tail(30)
+            hist_txt = build_history_text(hist_list)
+            quick_summary = build_quick_summary(manifest, hist_list)
 
-    mod_name = decision.get("name") or f"module_{int(time.time())}"
-    mod_desc = decision.get("description") or "module utilitaire pour l'agent"
+            decision = ask_llm_for_next_step(manifest, hist_txt, quick_summary)
+            if decision.get("action") != "write_module":
+                append_history({"event": "llm_decision_noop"})
+            else:
+                mod_name = decision.get("name") or f"module_{int(time.time())}"
+                mod_desc = decision.get("description") or "module utilitaire pour l'agent"
 
-    code = ask_llm_for_module_code(mod_name, mod_desc, manifest, hist_txt)
-    if not code.strip():
-        append_history({"event": "llm_empty_module", "name": mod_name})
-        return
+                valid_code = generate_valid_module_code(
+                    mod_name, mod_desc, manifest, hist_txt, context="initial"
+                )
+                if valid_code:
+                    fname = write_module_file(mod_name, valid_code)
+                    print(f"[agent] module ajouté: {fname}")
 
-    fname = write_module_file(mod_name, code)
-    print(f"[agent] module ajouté: {fname}")
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("[agent] arrêt demandé, au revoir")
 
 
 if __name__ == "__main__":

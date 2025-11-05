@@ -824,6 +824,40 @@ Rappels :
     return code
 
 
+def ask_llm_to_fix_module_code(
+    name: str,
+    description: str,
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    previous_code: str,
+    error_message: str,
+) -> str:
+    prompt = f"""
+Le code suivant pour le module {name} provoque une erreur de validation :
+---
+{previous_code}
+---
+Erreur détectée : {error_message}
+
+Réécris le module complet en corrigeant le problème tout en respectant la description :
+{description}
+
+Rappels :
+- le module doit pouvoir être importé sans erreur
+- si besoin: def init(ctx): ...
+- si besoin: def tick(ctx): ...
+- chaque fonction doit contenir un corps valide (au minimum "pass")
+- n'appelle pas init(ctx) ou tick(ctx) au niveau global
+- renvoie UNIQUEMENT le code Python, sans balise.
+"""
+    code = call_llm(prompt)
+    if not code:
+        return ""
+    if "```" in code:
+        code = code.replace("```python", "").replace("```", "").strip()
+    return code
+
+
 # -------------------------
 # main
 # -------------------------

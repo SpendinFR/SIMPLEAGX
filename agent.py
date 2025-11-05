@@ -79,7 +79,9 @@ def call_llm(prompt: str) -> str:
         )
         out, err = proc.communicate(prompt)
         if err:
-            append_history({"event": "llm_stderr", "stderr": err})
+            cleaned_err = _clean_llm_stderr(err)
+            if cleaned_err:
+                append_history({"event": "llm_stderr", "stderr": cleaned_err})
         return (out or "").strip()
     except FileNotFoundError:
         append_history({"event": "llm_error", "error": "ollama introuvable"})
@@ -99,6 +101,9 @@ def _truncate(text: str, limit: int = 240) -> str:
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;?]*[A-Za-z]")
+_PY_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+")
+_SPINNER_FRAMES = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 
 def _parse_json_response(raw: str) -> Tuple[Optional[Any], Optional[str]]:
@@ -149,7 +154,7 @@ def _normalize_module_code(raw: str) -> str:
         stripped = line.lstrip()
         if not stripped:
             continue
-        if stripped.startswith(valid_prefixes) or stripped[0].isalnum():
+        if stripped.startswith(valid_prefixes) or _PY_ASSIGN_RE.match(stripped):
             start_idx = idx
             break
 
@@ -157,6 +162,22 @@ def _normalize_module_code(raw: str) -> str:
         text = "\n".join(lines[start_idx:]).strip()
 
     return text
+
+
+def _clean_llm_stderr(raw: str) -> str:
+    if not raw:
+        return ""
+
+    text = _ANSI_ESCAPE_RE.sub("", raw)
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if all(ch in _SPINNER_FRAMES for ch in stripped):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
 
 
 def _extract_module_metadata(path: str) -> Dict[str, Any]:

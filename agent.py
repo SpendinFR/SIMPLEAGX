@@ -104,6 +104,14 @@ _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)\s*```", re.IGNORECASE | re.
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;?]*[A-Za-z]")
 _PY_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+")
 _JSON_CODE_FIELD_RE = re.compile(r'"code"\s*:\s*"(?P<code>(?:\\.|[^"\\])*)"')
+_PLACEHOLDER_NAMES = {
+    "nom_du_module_sans_py",
+    "nom_du_module_sans_extension",
+    "module",
+    "module_python",
+    "nouveau_module",
+}
+_VALID_MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SPINNER_FRAMES = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 
@@ -242,6 +250,61 @@ def _clean_llm_stderr(raw: str) -> str:
     return "\n".join(cleaned_lines)
 
 
+def sanitize_module_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+
+    cleaned = name.strip()
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if lowered in _PLACEHOLDER_NAMES or lowered.startswith("nom_du_module_"):
+        return None
+
+    if not _VALID_MODULE_NAME_RE.match(cleaned):
+        return None
+
+    return cleaned
+
+
+def derive_module_basename(
+    preferred: Optional[str], *, fallback: str, extras: Optional[List[Optional[str]]] = None
+) -> str:
+    """Return a sanitized module basename, salvaging noisy inputs when possible."""
+
+    candidates: List[str] = []
+    if preferred:
+        candidates.append(preferred)
+    if extras:
+        for extra in extras:
+            if extra:
+                candidates.append(extra)
+
+    for candidate in candidates:
+        sanitized = sanitize_module_name(candidate)
+        if sanitized:
+            return sanitized
+
+    for candidate in candidates:
+        trimmed = candidate.strip()
+        if not trimmed:
+            continue
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", trimmed)
+        cleaned = cleaned.strip("_")
+        if cleaned and cleaned[0].isdigit():
+            cleaned = f"{fallback}_{cleaned}"
+        sanitized = sanitize_module_name(cleaned)
+        if sanitized:
+            return sanitized
+
+    sanitized_fallback = sanitize_module_name(fallback)
+    if sanitized_fallback:
+        return sanitized_fallback
+
+    return "module_auto"
+
+
 def _extract_module_metadata(path: str) -> Dict[str, Any]:
     meta: Dict[str, Any] = {
         "summary": "",
@@ -306,25 +369,77 @@ def build_manifest() -> List[Dict[str, Any]]:
 # Écriture de modules
 # -------------------------
 def write_module_file(name: str, code: str) -> str:
-    safe_name = name.replace(" ", "_").replace("-", "_")
-    ts = int(time.time())
-    fname = f"{ts}_{safe_name}.py"
+    base_name = derive_module_basename(name, fallback="module_auto")
+    final_base = base_name
+    suffix = 1
+    while os.path.exists(os.path.join(MODULES_DIR, f"{final_base}.py")):
+        final_base = f"{base_name}_{suffix}"
+        suffix += 1
+
+    fname = f"{final_base}.py"
     path = os.path.join(MODULES_DIR, fname)
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
-    append_history({"event": "module_written", "file": fname, "name": name})
+    history_event: Dict[str, Any] = {"event": "module_written", "file": fname, "name": final_base}
+    if name and name != final_base:
+        history_event["requested_name"] = name
+        if base_name != final_base:
+            history_event["normalized_name"] = base_name
+    append_history(history_event)
     return fname
 
 
+def _function_has_effective_body(body: List[ast.stmt]) -> bool:
+    for stmt in body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(getattr(stmt, "value", None), ast.Constant):
+            if isinstance(stmt.value.value, str):
+                continue
+        return True
+    return False
+
+
 def validate_module_code(code: str) -> Optional[str]:
-    """Return an error message if the code is not valid Python."""
+    """Return an error message if the code is not valid Python and structurally acceptable."""
+
     try:
+        tree = ast.parse(code)
         compile(code, "<module>", "exec")
     except SyntaxError as e:
         location = f" (ligne {e.lineno}, colonne {e.offset})" if e.lineno else ""
         return f"SyntaxError{location}: {e.msg}"
     except Exception as e:  # pragma: no cover - sécurité
         return f"Erreur lors de la compilation: {e}"
+
+    has_init = False
+    has_tick = False
+    init_effective = False
+    tick_effective = False
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            if node.name == "init":
+                has_init = True
+                if not node.args.args:
+                    return "init doit accepter un paramètre ctx"
+                if node.args.args[0].arg != "ctx":
+                    return "init doit avoir ctx comme premier paramètre"
+                init_effective = _function_has_effective_body(node.body)
+            elif node.name == "tick":
+                has_tick = True
+                if not node.args.args:
+                    return "tick doit accepter un paramètre ctx"
+                if node.args.args[0].arg != "ctx":
+                    return "tick doit avoir ctx comme premier paramètre"
+                tick_effective = _function_has_effective_body(node.body)
+
+    if not has_init or not has_tick:
+        return "le module doit définir les fonctions init(ctx) et tick(ctx)"
+
+    if not (init_effective or tick_effective):
+        return "init(ctx) ou tick(ctx) doit contenir du code effectif"
+
     return None
 
 
@@ -646,7 +761,27 @@ Pas de texte autour.
         )
         return
 
-    name = data.get("name") or public_name
+    requested_regen_name = data.get("name")
+    requested_regen_name = requested_regen_name if isinstance(requested_regen_name, str) else None
+    sanitized_requested = sanitize_module_name(requested_regen_name)
+    if sanitized_requested:
+        name = sanitized_requested
+    else:
+        name = derive_module_basename(
+            requested_regen_name,
+            fallback="regen_module",
+            extras=[public_name],
+        )
+        if requested_regen_name:
+            append_history(
+                {
+                    "event": "llm_invalid_module_name",
+                    "raw": requested_regen_name,
+                    "context": "regen_decision",
+                    "normalized": name,
+                }
+            )
+
     code = data.get("code")
     description = data.get("description")
     if description:
@@ -824,40 +959,6 @@ Rappels :
     return code
 
 
-def ask_llm_to_fix_module_code(
-    name: str,
-    description: str,
-    manifest: List[Dict[str, Any]],
-    history_txt: str,
-    previous_code: str,
-    error_message: str,
-) -> str:
-    prompt = f"""
-Le code suivant pour le module {name} provoque une erreur de validation :
----
-{previous_code}
----
-Erreur détectée : {error_message}
-
-Réécris le module complet en corrigeant le problème tout en respectant la description :
-{description}
-
-Rappels :
-- le module doit pouvoir être importé sans erreur
-- si besoin: def init(ctx): ...
-- si besoin: def tick(ctx): ...
-- chaque fonction doit contenir un corps valide (au minimum "pass")
-- n'appelle pas init(ctx) ou tick(ctx) au niveau global
-- renvoie UNIQUEMENT le code Python, sans balise.
-"""
-    code = call_llm(prompt)
-    if not code:
-        return ""
-    if "```" in code:
-        code = code.replace("```python", "").replace("```", "").strip()
-    return code
-
-
 # -------------------------
 # main
 # -------------------------
@@ -898,7 +999,23 @@ def main() -> None:
             if decision.get("action") != "write_module":
                 append_history({"event": "llm_decision_noop"})
             else:
-                mod_name = decision.get("name") or f"module_{int(time.time())}"
+                raw_name = decision.get("name")
+                requested_name = raw_name if isinstance(raw_name, str) else None
+                sanitized_requested = sanitize_module_name(requested_name)
+                if sanitized_requested:
+                    mod_name = sanitized_requested
+                else:
+                    mod_name = derive_module_basename(requested_name, fallback="module_auto")
+                    if requested_name:
+                        append_history(
+                            {
+                                "event": "llm_invalid_module_name",
+                                "raw": requested_name,
+                                "context": "initial_decision",
+                                "normalized": mod_name,
+                            }
+                        )
+
                 mod_desc = decision.get("description") or "module utilitaire pour l'agent"
 
                 valid_code = generate_valid_module_code(

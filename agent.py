@@ -140,6 +140,7 @@ _CAPABILITY_DESCRIPTIONS: Dict[str, str] = {
     "write_module": "enregistre un nouveau module Python dans ./modules",  # description
     "get_manifest": "donne la liste actuelle des modules (nom, taille, résumé)",  # description
     "get_history": "retourne les derniers événements pour analyse",  # description
+    "request_module_creation": "déclare qu'un nouveau module doit être généré (nom, description, code optionnel)",
 }
 
 
@@ -193,6 +194,56 @@ def register_capability(
             "description": effective_description,
         }
     )
+
+
+def enqueue_planner_request(
+    ctx: "ProbeDict",
+    name: Optional[str],
+    description: Optional[str],
+    *,
+    code: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Ajoute une requête de création de module dans la file du planificateur."""
+
+    if ctx is None:
+        return None
+
+    planner = ctx.setdefault("planner", ProbeDict())
+    queue = planner.setdefault("modules_to_create", [])
+    if not isinstance(queue, list):
+        queue = planner["modules_to_create"] = []
+
+    entry: Dict[str, Any] = {}
+    if name and isinstance(name, str):
+        entry["name"] = name.strip()
+    if description and isinstance(description, str):
+        entry["description"] = description.strip()
+
+    if "description" not in entry or not entry["description"]:
+        return None
+
+    if code and isinstance(code, str) and code.strip():
+        entry["code"] = code
+
+    if metadata:
+        for key, value in metadata.items():
+            if key in {"name", "description", "code"}:
+                continue
+            entry[key] = value
+
+    queue.append(entry)
+
+    history_event: Dict[str, Any] = {
+        "event": "planner_request_enqueued",
+        "name": entry.get("name"),
+        "description": entry.get("description"),
+    }
+    if code:
+        history_event["code_preview"] = _truncate(code, 80)
+    append_history(history_event)
+
+    return entry
 
 
 def build_capabilities_catalog(functions: Dict[str, Any]) -> ProbeDict:
@@ -883,16 +934,49 @@ def validate_module_code(code: str) -> Optional[str]:
     def _stub_get_history(n: int = 80) -> List[Dict[str, Any]]:
         return probe_ctx.get("history", [])[:n]
 
+    def _stub_request_module_creation(
+        name: Optional[str],
+        description: Optional[str],
+        code: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        planner = probe_ctx.setdefault("planner", ProbeDict())
+        queue = planner.setdefault("modules_to_create", [])
+        if not isinstance(queue, list):
+            queue = planner["modules_to_create"] = []
+
+        entry: Dict[str, Any] = {}
+        if name and isinstance(name, str):
+            entry["name"] = name.strip()
+        if description and isinstance(description, str):
+            entry["description"] = description.strip()
+        if code and isinstance(code, str) and code.strip():
+            entry["code"] = code
+        if metadata:
+            for key, value in metadata.items():
+                if key in {"name", "description", "code"}:
+                    continue
+                entry[key] = value
+
+        if "description" not in entry or not entry["description"]:
+            return None
+
+        queue.append(entry)
+        probe_ctx.setdefault("planner_requests", []).append(entry)
+        return entry
+
     probe_ctx["call_llm"] = _stub_call_llm
     probe_ctx["write_module"] = _stub_write_module
     probe_ctx["get_manifest"] = _stub_get_manifest
     probe_ctx["get_history"] = _stub_get_history
+    probe_ctx["request_module_creation"] = _stub_request_module_creation
     probe_ctx["capabilities"] = build_capabilities_catalog(
         {
             "call_llm": probe_ctx["call_llm"],
             "write_module": probe_ctx["write_module"],
             "get_manifest": probe_ctx["get_manifest"],
             "get_history": probe_ctx["get_history"],
+            "request_module_creation": probe_ctx["request_module_creation"],
         }
     )
     local_capability_descriptions = dict(_CAPABILITY_DESCRIPTIONS)
@@ -1356,6 +1440,7 @@ Contraintes impératives:
 - définis obligatoirement def init(ctx): et def tick(ctx):
 - init(ctx) doit initialiser ou mettre à jour des données utiles dans ctx (pas seulement pass)
 - tick(ctx) doit effectuer au moins une action concrète ou une mise à jour exploitable
+- si tu planifies d'autres modules, ajoute des entrées dict dans ctx["planner"]["modules_to_create"] ou appelle ctx["request_module_creation"](nom, description, code_optionnel)
 - n'appelle pas init(ctx) ou tick(ctx) au niveau global
 - renvoie UNIQUEMENT un JSON strict {{"code": "..."}}
 - encode les retours à la ligne avec \n dans la valeur de "code"
@@ -1393,6 +1478,7 @@ Rappels :
 - définis forcément init(ctx) et tick(ctx)
 - init(ctx) doit préparer un état utile (plus qu'un simple pass)
 - tick(ctx) doit mener une action exploitable (plus qu'un simple pass)
+- si tu planifies d'autres modules, ajoute des entrées dict dans ctx["planner"]["modules_to_create"] ou appelle ctx["request_module_creation"](nom, description, code_optionnel)
 - n'appelle pas init(ctx) ou tick(ctx) au niveau global
 - renvoie UNIQUEMENT un JSON strict {{"code": "..."}}
 - encode les retours à la ligne avec \n dans la valeur de "code"
@@ -1431,12 +1517,29 @@ def main() -> None:
     ctx["write_module"] = write_module_file
     ctx["get_manifest"] = build_manifest
     ctx["get_history"] = get_history_fn
+
+    def request_module_creation(
+        name: Optional[str],
+        description: Optional[str],
+        code: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return enqueue_planner_request(
+            ctx,
+            name,
+            description,
+            code=code,
+            metadata=metadata,
+        )
+
+    ctx["request_module_creation"] = request_module_creation
     ctx["capabilities"] = build_capabilities_catalog(
         {
             "call_llm": ctx["call_llm"],
             "write_module": ctx["write_module"],
             "get_manifest": ctx["get_manifest"],
             "get_history": ctx["get_history"],
+            "request_module_creation": ctx["request_module_creation"],
         }
     )
     ctx["register_capability"] = lambda name, fn, description=None: register_capability(

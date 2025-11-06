@@ -8,6 +8,8 @@ Petit noyau évolutif
 → au run suivant, le module est dispo
 """
 
+from __future__ import annotations
+
 import os
 import json
 import importlib.util

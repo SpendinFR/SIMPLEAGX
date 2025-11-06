@@ -115,6 +115,46 @@ _VALID_MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SPINNER_FRAMES = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 
+class ProbeDict(dict):
+    """Petit dict offrant un accès attribut pour les validations."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def _wrap(value: Any) -> Any:
+        if isinstance(value, dict) and not isinstance(value, ProbeDict):
+            return ProbeDict(value)
+        return value
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        if args or kwargs:
+            self.update(*args, **kwargs)
+
+    def __setitem__(self, key: Any, value: Any) -> None:  # type: ignore[override]
+        super().__setitem__(key, self._wrap(value))
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        data = dict(*args, **kwargs)
+        for key, value in data.items():
+            super().__setitem__(key, self._wrap(value))
+
+    def __getattr__(self, item: str) -> Any:
+        try:
+            return self[item]
+        except KeyError as exc:  # pragma: no cover - protection simple
+            raise AttributeError(item) from exc
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        self[key] = value
+
+    def __delattr__(self, key: str) -> None:
+        try:
+            del self[key]
+        except KeyError as exc:  # pragma: no cover - protection simple
+            raise AttributeError(key) from exc
+
+
 def _parse_json_response(raw: str) -> Tuple[Optional[Any], Optional[str]]:
     """Try to decode JSON even if text surrounds it."""
 
@@ -390,11 +430,15 @@ def write_module_file(name: str, code: str) -> str:
 
 
 def _function_has_effective_body(body: List[ast.stmt]) -> bool:
-    for stmt in body:
+    """Detecte si la fonction contient autre chose qu'un simple pass/docstring."""
+
+    for idx, stmt in enumerate(body):
         if isinstance(stmt, ast.Pass):
             continue
-        if isinstance(stmt, ast.Expr) and isinstance(getattr(stmt, "value", None), ast.Constant):
-            if isinstance(stmt.value.value, str):
+        if isinstance(stmt, ast.Expr):
+            value = getattr(stmt, "value", None)
+            if idx == 0 and isinstance(value, ast.Constant) and isinstance(value.value, str):
+                # docstring de tête
                 continue
         return True
     return False
@@ -449,8 +493,11 @@ def validate_module_code(code: str) -> Optional[str]:
     if not has_init or not has_tick:
         return "le module doit définir les fonctions init(ctx) et tick(ctx)"
 
-    if not (init_effective or tick_effective):
-        return "init(ctx) ou tick(ctx) doit contenir du code effectif"
+    if not init_effective:
+        return "init(ctx) doit contenir autre chose qu'un simple pass ou docstring"
+
+    if not tick_effective:
+        return "tick(ctx) doit contenir autre chose qu'un simple pass ou docstring"
 
     namespace: Dict[str, Any] = {}
     try:
@@ -464,8 +511,8 @@ def validate_module_code(code: str) -> Optional[str]:
     if not callable(init_fn) or not callable(tick_fn):
         return "le module doit définir les fonctions init(ctx) et tick(ctx)"
 
-    probe_ctx: Dict[str, Any] = {
-        "history": [
+    probe_ctx = ProbeDict(
+        history=[
             {
                 "event": "llm_stderr",
                 "stderr": "Error: invalid model path",
@@ -474,13 +521,13 @@ def validate_module_code(code: str) -> Optional[str]:
                 "event": "llm_decision_noop",
             },
         ],
-        "tickers": [],
-        "planner": {"modules_to_create": []},
-        "manifest": [],
-        "modules": [],
-        "suggestions": [],
-        "pattern": True,
-    }
+        tickers=[],
+        planner={"modules_to_create": []},
+        manifest=[],
+        modules=[],
+        suggestions=[],
+        pattern=True,
+    )
 
     try:
         init_fn(probe_ctx)
@@ -957,15 +1004,16 @@ Modules existants:
 Historique récent:
 {history_txt}
 
-Contraintes:
-- doit pouvoir être importé sans erreur
-- si besoin: def init(ctx): ...
-- si besoin: def tick(ctx): ...
-- chaque fonction doit contenir un corps valide (au minimum "pass")
+Contraintes impératives:
+- le fichier doit pouvoir être importé sans erreur
+- le contexte ctx est un dictionnaire Python (utilise ctx["cle"] ou ctx.cle)
+- définis obligatoirement def init(ctx): et def tick(ctx):
+- init(ctx) doit initialiser ou mettre à jour des données utiles dans ctx (pas seulement pass)
+- tick(ctx) doit effectuer au moins une action concrète ou une mise à jour exploitable
 - n'appelle pas init(ctx) ou tick(ctx) au niveau global
-- renvoie UNIQUEMENT un JSON de la forme {{"code": "..."}}
+- renvoie UNIQUEMENT un JSON strict {{"code": "..."}}
 - encode les retours à la ligne avec \n dans la valeur de "code"
-- pas d'autres champs ni commentaires.
+- aucun autre texte ou champ en sortie.
 """
     code = call_llm(prompt)
     if not code:
@@ -995,13 +1043,14 @@ Réécris le module complet en corrigeant le problème tout en respectant la des
 
 Rappels :
 - le module doit pouvoir être importé sans erreur
-- si besoin: def init(ctx): ...
-- si besoin: def tick(ctx): ...
-- chaque fonction doit contenir un corps valide (au minimum "pass")
+- le contexte ctx est un dict : manipule-le avec ctx["cle"] (ou ctx.cle)
+- définis forcément init(ctx) et tick(ctx)
+- init(ctx) doit préparer un état utile (plus qu'un simple pass)
+- tick(ctx) doit mener une action exploitable (plus qu'un simple pass)
 - n'appelle pas init(ctx) ou tick(ctx) au niveau global
-- renvoie UNIQUEMENT un JSON de la forme {{"code": "..."}}
+- renvoie UNIQUEMENT un JSON strict {{"code": "..."}}
 - encode les retours à la ligne avec \n dans la valeur de "code"
-- pas d'autres champs ni commentaires.
+- aucun autre texte ou champ en sortie.
 """
     code = call_llm(prompt)
     if not code:

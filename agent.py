@@ -19,6 +19,7 @@ import traceback
 from collections import Counter
 import ast
 import re
+from types import ModuleType
 from typing import Any, Dict, List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1099,34 +1100,66 @@ def build_recent_activity_summary(hist_list: List[Dict[str, Any]], limit: int = 
 # -------------------------
 # chargement dynamique
 # -------------------------
-def load_all_modules(ctx: Dict[str, Any]) -> List[str]:
+def load_all_modules(
+    ctx: Dict[str, Any],
+    module_cache: Dict[str, ModuleType],
+    module_mtimes: Dict[str, float],
+) -> List[str]:
     loaded: List[str] = []
     if not os.path.isdir(MODULES_DIR):
+        module_cache.clear()
+        module_mtimes.clear()
         return loaded
+
+    discovered: List[str] = []
     for fname in sorted(os.listdir(MODULES_DIR)):
         if not fname.endswith(".py"):
             continue
         path = os.path.join(MODULES_DIR, fname)
         mod_name = f"mods_{fname[:-3]}"
+        discovered.append(fname)
         try:
-            spec = importlib.util.spec_from_file_location(mod_name, path)
-            if spec is None or spec.loader is None:
+            current_mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+
+        module = module_cache.get(fname)
+        cached_mtime = module_mtimes.get(fname)
+        needs_reload = module is None or cached_mtime != current_mtime
+
+        if needs_reload:
+            try:
+                spec = importlib.util.spec_from_file_location(mod_name, path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)  # type: ignore
+                module_cache[fname] = module
+                module_mtimes[fname] = current_mtime
+
+                if hasattr(module, "init") and callable(module.init):
+                    module.init(ctx)
+            except Exception as e:
+                traceback.print_exc()
+                module_cache.pop(fname, None)
+                module_mtimes.pop(fname, None)
+                append_history(
+                    {"event": "module_load_error", "module": fname, "error": str(e)}
+                )
                 continue
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)  # type: ignore
 
-            # le module voit le ctx
-            if hasattr(mod, "init") and callable(mod.init):
-                mod.init(ctx)
+        module = module_cache.get(fname)
+        if module and hasattr(module, "tick") and callable(module.tick):
+            ctx.setdefault("tickers", []).append({"module": fname, "tick": module.tick})
 
-            # le module peut s'enregistrer pour les ticks
-            if hasattr(mod, "tick") and callable(mod.tick):
-                ctx.setdefault("tickers", []).append({"module": fname, "tick": mod.tick})
+        loaded.append(fname)
 
-            loaded.append(fname)
-        except Exception as e:
-            traceback.print_exc()
-            append_history({"event": "module_load_error", "module": fname, "error": str(e)})
+    discovered_set = set(discovered)
+
+    # retirer les modules supprimés du cache
+    for stale in set(module_cache) - discovered_set:
+        module_cache.pop(stale, None)
+        module_mtimes.pop(stale, None)
     return loaded
 
 
@@ -1546,6 +1579,9 @@ def main() -> None:
         ctx, name, fn, description
     )
 
+    module_cache: Dict[str, ModuleType] = {}
+    module_mtimes: Dict[str, float] = {}
+
     try:
         while True:
             # les tickers sont reconstruits à chaque itération
@@ -1555,7 +1591,7 @@ def main() -> None:
             if isinstance(planner_ctx, ProbeDict):
                 planner_ctx.setdefault("modules_to_create", [])
 
-            loaded = load_all_modules(ctx)
+            loaded = load_all_modules(ctx, module_cache, module_mtimes)
             append_history({"event": "modules_loaded", "modules": loaded})
 
             # on laisse les modules jouer

@@ -734,6 +734,37 @@ def validate_module_code(code: str) -> Optional[str]:
         modules=[],
         suggestions=[],
         pattern=True,
+        base_dir=BASE_DIR,
+        mem_dir=MEM_DIR,
+        modules_dir=MODULES_DIR,
+    )
+
+    def _stub_call_llm(prompt: str) -> str:
+        return ""
+
+    def _stub_write_module(name: str, code: str) -> None:
+        probe_ctx.setdefault("written_modules", []).append({"name": name, "code": code})
+
+    def _stub_get_manifest() -> List[Dict[str, Any]]:
+        return []
+
+    def _stub_get_history(n: int = 80) -> List[Dict[str, Any]]:
+        return probe_ctx.get("history", [])[:n]
+
+    probe_ctx["call_llm"] = _stub_call_llm
+    probe_ctx["write_module"] = _stub_write_module
+    probe_ctx["get_manifest"] = _stub_get_manifest
+    probe_ctx["get_history"] = _stub_get_history
+    probe_ctx["capabilities"] = build_capabilities_catalog(
+        {
+            "call_llm": probe_ctx["call_llm"],
+            "write_module": probe_ctx["write_module"],
+            "get_manifest": probe_ctx["get_manifest"],
+            "get_history": probe_ctx["get_history"],
+        }
+    )
+    probe_ctx["register_capability"] = lambda name, fn, description=None: register_capability(
+        probe_ctx, name, fn, description
     )
 
     try:

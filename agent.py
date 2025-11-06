@@ -763,9 +763,26 @@ def validate_module_code(code: str) -> Optional[str]:
             "get_history": probe_ctx["get_history"],
         }
     )
-    probe_ctx["register_capability"] = lambda name, fn, description=None: register_capability(
-        probe_ctx, name, fn, description
-    )
+
+    def _stub_register_capability(name: str, fn: Any, description: Optional[str] = None) -> None:
+        if not name or not fn:
+            return
+
+        safe_name = name.strip()
+        if not safe_name:
+            return
+
+        catalog = probe_ctx.setdefault("capabilities", ProbeDict())
+        if safe_name in catalog and catalog[safe_name].get("fn") is fn:
+            return
+
+        effective_description = description or _CAPABILITY_DESCRIPTIONS.get(safe_name, "outil interne")
+        catalog[safe_name] = ProbeDict({"fn": fn, "description": effective_description})
+        probe_ctx.setdefault("registered_capabilities", []).append(
+            {"name": safe_name, "description": effective_description}
+        )
+
+    probe_ctx["register_capability"] = _stub_register_capability
 
     try:
         init_fn(probe_ctx)

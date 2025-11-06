@@ -400,17 +400,29 @@ def _function_has_effective_body(body: List[ast.stmt]) -> bool:
     return False
 
 
+def _is_allowed_toplevel(node: ast.stmt) -> bool:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom, ast.Assign, ast.AnnAssign)):
+        return True
+    if isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant) and isinstance(node.value.value, str):
+        return True
+    return False
+
+
 def validate_module_code(code: str) -> Optional[str]:
     """Return an error message if the code is not valid Python and structurally acceptable."""
 
     try:
         tree = ast.parse(code)
-        compile(code, "<module>", "exec")
+        compiled = compile(code, "<module>", "exec")
     except SyntaxError as e:
         location = f" (ligne {e.lineno}, colonne {e.offset})" if e.lineno else ""
         return f"SyntaxError{location}: {e.msg}"
     except Exception as e:  # pragma: no cover - sécurité
         return f"Erreur lors de la compilation: {e}"
+
+    for node in tree.body:
+        if not _is_allowed_toplevel(node):
+            return "le code au niveau global doit se limiter aux imports, affectations, classes et fonctions"
 
     has_init = False
     has_tick = False
@@ -439,6 +451,46 @@ def validate_module_code(code: str) -> Optional[str]:
 
     if not (init_effective or tick_effective):
         return "init(ctx) ou tick(ctx) doit contenir du code effectif"
+
+    namespace: Dict[str, Any] = {}
+    try:
+        exec(compiled, namespace)
+    except Exception as e:
+        return f"erreur lors de l'exécution initiale du module: {e}"
+
+    init_fn = namespace.get("init")
+    tick_fn = namespace.get("tick")
+
+    if not callable(init_fn) or not callable(tick_fn):
+        return "le module doit définir les fonctions init(ctx) et tick(ctx)"
+
+    probe_ctx: Dict[str, Any] = {
+        "history": [
+            {
+                "event": "llm_stderr",
+                "stderr": "Error: invalid model path",
+            },
+            {
+                "event": "llm_decision_noop",
+            },
+        ],
+        "tickers": [],
+        "planner": {"modules_to_create": []},
+        "manifest": [],
+        "modules": [],
+        "suggestions": [],
+        "pattern": True,
+    }
+
+    try:
+        init_fn(probe_ctx)
+    except Exception as e:
+        return f"init(ctx) échoue lors d'un appel de test: {e}"
+
+    try:
+        tick_fn(probe_ctx)
+    except Exception as e:
+        return f"tick(ctx) échoue lors d'un appel de test: {e}"
 
     return None
 

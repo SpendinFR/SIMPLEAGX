@@ -113,6 +113,92 @@ _PLACEHOLDER_NAMES = {
 }
 _VALID_MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SPINNER_FRAMES = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+_PLANNING_KEYWORDS = (
+    "plan",
+    "planner",
+    "planificateur",
+    "roadmap",
+    "strat",
+    "organis",
+)
+_ANALYSIS_KEYWORDS = (
+    "analyse",
+    "analy",
+    "error",
+    "erreur",
+    "observe",
+    "monitor",
+    "inspect",
+)
+_EXPANSION_PLANNING_THRESHOLD = 2
+_EXPANSION_ANALYSIS_THRESHOLD = 1
+
+_CAPABILITY_DESCRIPTIONS: Dict[str, str] = {
+    "call_llm": "appelle le modèle configuré pour obtenir un texte ou un JSON",  # description
+    "write_module": "enregistre un nouveau module Python dans ./modules",  # description
+    "get_manifest": "donne la liste actuelle des modules (nom, taille, résumé)",  # description
+    "get_history": "retourne les derniers événements pour analyse",  # description
+}
+
+
+def build_capabilities_block(catalog: Optional[Dict[str, Any]] = None) -> str:
+    lines: List[str] = []
+
+    if catalog:
+        for name in sorted(catalog):
+            entry = catalog.get(name)
+            description: Optional[str] = None
+            if isinstance(entry, ProbeDict):
+                description = entry.get("description")
+            elif isinstance(entry, dict):
+                description = entry.get("description")
+            if not description:
+                description = _CAPABILITY_DESCRIPTIONS.get(name, "outil interne")
+            lines.append(f"- {name} : {description}")
+
+    if not lines:
+        lines = [f"- {name} : {desc}" for name, desc in sorted(_CAPABILITY_DESCRIPTIONS.items())]
+
+    return "\n".join(lines)
+
+
+def register_capability(
+    ctx: "ProbeDict", name: str, fn: Any, description: Optional[str] = None
+) -> None:
+    """Expose dynamiquement une capacité aux autres modules et au prompt."""
+
+    if not name or not fn:
+        return
+
+    safe_name = name.strip()
+    if not safe_name:
+        return
+
+    catalog = ctx.setdefault("capabilities", ProbeDict())
+    effective_description = description or _CAPABILITY_DESCRIPTIONS.get(safe_name, "outil interne")
+    existing = catalog.get(safe_name)
+    if isinstance(existing, (dict, ProbeDict)):
+        if existing.get("fn") is fn and existing.get("description") == effective_description:
+            return
+    catalog[safe_name] = ProbeDict({"fn": fn, "description": effective_description})
+    if description:
+        _CAPABILITY_DESCRIPTIONS[safe_name] = description
+
+    append_history(
+        {
+            "event": "capability_registered",
+            "name": safe_name,
+            "description": effective_description,
+        }
+    )
+
+
+def build_capabilities_catalog(functions: Dict[str, Any]) -> ProbeDict:
+    catalog = {}
+    for name, func in functions.items():
+        desc = _CAPABILITY_DESCRIPTIONS.get(name, "outil interne")
+        catalog[name] = ProbeDict({"fn": func, "description": desc})
+    return ProbeDict(catalog)
 
 
 class ProbeDict(dict):
@@ -403,6 +489,127 @@ def build_manifest() -> List[Dict[str, Any]]:
             }
         )
     return items
+
+
+def _classify_manifest_focus(manifest: List[Dict[str, Any]]) -> Counter:
+    counts: Counter = Counter()
+    for entry in manifest:
+        name = (entry.get("name") or "").lower()
+        summary = (entry.get("summary") or "").lower()
+        blob = f"{name} {summary}"
+        if any(keyword in blob for keyword in _PLANNING_KEYWORDS):
+            counts["planning"] += 1
+        if any(keyword in blob for keyword in _ANALYSIS_KEYWORDS):
+            counts["analysis"] += 1
+    counts["total"] = len(manifest)
+    return counts
+
+
+def build_decision_prompt(
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    quick_summary: str,
+    capabilities_block: str,
+) -> Tuple[str, str, Counter]:
+    focus_counts = _classify_manifest_focus(manifest)
+    planning_count = focus_counts.get("planning", 0)
+    analysis_count = focus_counts.get("analysis", 0)
+
+    variant = "default"
+    focus_lines = [
+        "Ta priorité est de consolider l'observation et la planification.",
+        "Propose des modules qui analysent l'état, planifient les suites ou inspectent les erreurs récentes.",
+    ]
+
+    if (
+        planning_count >= _EXPANSION_PLANNING_THRESHOLD
+        and analysis_count >= _EXPANSION_ANALYSIS_THRESHOLD
+    ):
+        variant = "expansion"
+        focus_lines = [
+            "Tu disposes déjà d'une base de planification/diagnostic (modules orientés planification et analyse en place).",
+            "Accélère désormais l'autonomie : crée des modules qui exploitent ces connaissances pour agir, coordonner ou ajouter des outils concrets.",
+            "Repère les capacités manquantes (mémoire active, instrumentation, contrôle, coopération entre modules) et comble-les.",
+        ]
+
+    focus_block = "\n".join(f"- {line}" for line in focus_lines)
+    if variant == "default":
+        rule_block = """Règles IMPORTANTES :
+1. Tu NE réécris PAS l'agent principal.
+2. Tu NE renvoies PAS de code ici.
+3. Tu ne proposes un module QUE s'il sert à :
+   - observer l'état (modules, mémoire, erreurs)
+   - organiser / planifier les prochains modules
+   - créer d'autres générateurs de modules
+   - analyser les erreurs des modules existants
+4. Toujours répondre en JSON STRICT.
+"""
+    else:
+        rule_block = """Règles IMPORTANTES :
+1. Tu NE réécris PAS l'agent principal.
+2. Tu NE renvoies PAS de code ici.
+3. Les modules proposés doivent étendre concrètement les capacités de l'agent (exécution, coordination, outillage exploitable) en s'appuyant sur les ressources existantes.
+4. Toujours répondre en JSON STRICT.
+"""
+
+    prompt = f"""
+Synthèse rapide :
+{quick_summary}
+
+But ultime explicite : faire évoluer l'agent vers une intelligence générale émergente via un écosystème modulaire auto-améliorant.
+
+Tu disposes d'un LLM puissant : exploite-le pour orchestrer la progression.
+
+Focus actuel :
+{focus_block}
+
+Capacités noyau accessibles via ctx :
+{capabilities_block}
+
+Procède étape par étape :
+1. Observe l'état actuel ci-dessus.
+2. Dégage l'amélioration la plus utile pour progresser vers le but ultime.
+3. Choisis d'agir (write_module) ou de patienter (noop) selon cette analyse.
+
+Tu es le CERVEAU de l'agent.
+Ton rôle N'EST PAS d'écrire le gros programme, mais de décider s'il faut ajouter UN PETIT module Python autonome.
+
+Contexte modules déjà présents (nom + taille) :
+{json.dumps(manifest, ensure_ascii=False, indent=2)}
+
+Historique récent :
+{history_txt}
+
+Objectif global de l'agent :
+- apprendre en ajoutant de petits modules
+- que ces modules puissent s'initialiser (init(ctx)) et agir à chaque tick (tick(ctx))
+- converger vers un système qui se réécrit, utilise ses propres capacités et progresse vers l'AGI visée
+
+{rule_block}
+Format de réponse OBLIGATOIRE :
+{{
+  "action": "write_module" | "noop",
+  "name": "nom_du_module_sans_py",
+  "description": "une phrase claire sur ce que doit faire le module"
+}}
+
+Exemples valides :
+{{
+  "action": "noop",
+  "name": "",
+  "description": ""
+}}
+ou
+{{
+  "action": "write_module",
+  "name": "planner_local",
+  "description": "tenir une petite liste de modules à créer selon les erreurs vues dans l'historique"
+}}
+
+RENVOIE UNIQUEMENT le JSON, pas de commentaire.
+"""
+
+    return prompt, variant, focus_counts
 
 
 # -------------------------
@@ -908,67 +1115,21 @@ Pas de texte autour.
 # phase "juge"
 # -------------------------
 def ask_llm_for_next_step(
-    manifest: List[Dict[str, Any]], history_txt: str, quick_summary: str
+    manifest: List[Dict[str, Any]],
+    history_txt: str,
+    quick_summary: str,
+    capabilities_block: str,
 ) -> Dict[str, Any]:
-    prompt = f"""
-Synthèse rapide :
-{quick_summary}
-
-But ultime explicite : faire évoluer l'agent vers une intelligence générale émergente via un écosystème modulaire auto-améliorant.
-
-Tu disposes d'un LLM puissant : exploite-le pour orchestrer la progression.
-
-Procède étape par étape :
-1. Observe l'état actuel ci-dessus.
-2. Dégage l'amélioration la plus utile pour progresser vers le but ultime.
-3. Choisis d'agir (write_module) ou de patienter (noop) selon cette analyse.
-
-Tu es le CERVEAU de l'agent.
-Ton rôle N'EST PAS d'écrire le gros programme, mais de décider s'il faut ajouter UN PETIT module Python autonome.
-
-Contexte modules déjà présents (nom + taille) :
-{json.dumps(manifest, ensure_ascii=False, indent=2)}
-
-Historique récent :
-{history_txt}
-
-Objectif global de l'agent :
-- apprendre en ajoutant de petits modules
-- que ces modules puissent s'initialiser (init(ctx)) et agir à chaque tick (tick(ctx))
-- converger vers un système qui se réécrit, utilise ses propres capacités et progresse vers l'AGI visée
-
-Règles IMPORTANTES :
-1. Tu NE réécris PAS l'agent principal.
-2. Tu NE renvoies PAS de code ici.
-3. Tu ne proposes un module QUE s'il sert à :
-   - observer l'état (modules, mémoire, erreurs)
-   - organiser / planifier les prochains modules
-   - créer d'autres générateurs de modules
-   - analyser les erreurs des modules existants
-4. Toujours répondre en JSON STRICT.
-
-Format de réponse OBLIGATOIRE :
-{{
-  "action": "write_module" | "noop",
-  "name": "nom_du_module_sans_py",
-  "description": "une phrase claire sur ce que doit faire le module"
-}}
-
-Exemples valides :
-{{
-  "action": "noop",
-  "name": "",
-  "description": ""
-}}
-ou
-{{
-  "action": "write_module",
-  "name": "planner_local",
-  "description": "tenir une petite liste de modules à créer selon les erreurs vues dans l'historique"
-}}
-
-RENVOIE UNIQUEMENT le JSON, pas de commentaire.
-"""
+    prompt, variant, focus_counts = build_decision_prompt(
+        manifest, history_txt, quick_summary, capabilities_block
+    )
+    append_history(
+        {
+            "event": "decision_prompt_variant",
+            "variant": variant,
+            "counts": dict(focus_counts),
+        }
+    )
 
     out = call_llm(prompt)
     if not out:
@@ -1067,17 +1228,29 @@ def main() -> None:
     ensure_dirs()
 
     # ctx partagé avec les modules
-    ctx: Dict[str, Any] = {
-        "base_dir": BASE_DIR,
-        "mem_dir": MEM_DIR,
-        "modules_dir": MODULES_DIR,
-    }
+    ctx: ProbeDict = ProbeDict(
+        base_dir=BASE_DIR,
+        mem_dir=MEM_DIR,
+        modules_dir=MODULES_DIR,
+    )
 
     # on expose les outils du noyau AUX modules
+    get_history_fn = lambda n=80: read_history_tail(n)
     ctx["call_llm"] = call_llm
     ctx["write_module"] = write_module_file
     ctx["get_manifest"] = build_manifest
-    ctx["get_history"] = lambda n=80: read_history_tail(n)
+    ctx["get_history"] = get_history_fn
+    ctx["capabilities"] = build_capabilities_catalog(
+        {
+            "call_llm": ctx["call_llm"],
+            "write_module": ctx["write_module"],
+            "get_manifest": ctx["get_manifest"],
+            "get_history": ctx["get_history"],
+        }
+    )
+    ctx["register_capability"] = lambda name, fn, description=None: register_capability(
+        ctx, name, fn, description
+    )
 
     try:
         while True:
@@ -1096,7 +1269,10 @@ def main() -> None:
             hist_txt = build_history_text(hist_list)
             quick_summary = build_quick_summary(manifest, hist_list)
 
-            decision = ask_llm_for_next_step(manifest, hist_txt, quick_summary)
+            capabilities_block = build_capabilities_block(ctx.get("capabilities"))
+            decision = ask_llm_for_next_step(
+                manifest, hist_txt, quick_summary, capabilities_block
+            )
             if decision.get("action") != "write_module":
                 append_history({"event": "llm_decision_noop"})
             else:

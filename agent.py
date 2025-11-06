@@ -433,6 +433,136 @@ def derive_module_basename(
     return "module_auto"
 
 
+def _coerce_planner_request(entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalise une requête planificateur en (name, description, code initial)."""
+
+    if isinstance(entry, ProbeDict):
+        entry = dict(entry)
+
+    if not isinstance(entry, dict):
+        return None
+
+    raw_name = entry.get("name") or entry.get("module") or entry.get("filename")
+    extras: List[str] = []
+
+    for key in ("alias", "suggested_name", "fallback_name"):
+        value = entry.get(key)
+        if isinstance(value, str):
+            extras.append(value)
+
+    if isinstance(raw_name, str) and raw_name.endswith(".py"):
+        raw_name = raw_name[:-3]
+
+    extras = [value[:-3] if isinstance(value, str) and value.endswith(".py") else value for value in extras]
+
+    fallback_name = entry.get("fallback")
+    fallback = fallback_name if isinstance(fallback_name, str) and fallback_name.strip() else "planned_module"
+
+    base_name = derive_module_basename(raw_name if isinstance(raw_name, str) else None, fallback=fallback, extras=extras or None)
+
+    if isinstance(raw_name, str) and raw_name and raw_name != base_name:
+        append_history(
+            {
+                "event": "planner_request_name_adjusted",
+                "requested": raw_name,
+                "normalized": base_name,
+            }
+        )
+
+    description_fields = [
+        entry.get("description"),
+        entry.get("summary"),
+        entry.get("goal"),
+        entry.get("reason"),
+    ]
+    description = next((str(field).strip() for field in description_fields if isinstance(field, str) and field.strip()), None)
+    if not description:
+        description = "module utilitaire planifié par un module existant"
+
+    initial_code = entry.get("code")
+    if isinstance(initial_code, str) and initial_code.strip():
+        seed = initial_code
+    else:
+        seed = None
+
+    return {"name": base_name, "description": description, "initial_code": seed}
+
+
+def process_planner_requests(ctx: ProbeDict) -> bool:
+    """Consomme les modules demandés par le planificateur interne."""
+
+    planner = ctx.get("planner")
+    if not isinstance(planner, (dict, ProbeDict)):
+        return False
+
+    queue = planner.get("modules_to_create")
+    if not isinstance(queue, list) or not queue:
+        return False
+
+    processed = False
+
+    manifest = build_manifest()
+    hist_list = read_history_tail(30)
+    hist_txt = build_history_text(hist_list)
+
+    # Consommer les requêtes en FIFO
+    while queue:
+        raw_entry = queue.pop(0)
+        request = _coerce_planner_request(raw_entry)
+        if not request:
+            append_history(
+                {
+                    "event": "planner_request_discarded",
+                    "reason": "entrée invalide",
+                    "preview": _truncate(str(raw_entry), 120),
+                }
+            )
+            continue
+
+        name = request["name"]
+        description = request["description"]
+        initial_code = request.get("initial_code")
+
+        valid_code = generate_valid_module_code(
+            name,
+            description,
+            manifest,
+            hist_txt,
+            context="planner",
+            initial_code=initial_code,
+        )
+
+        if not valid_code:
+            append_history(
+                {
+                    "event": "planner_request_failed",
+                    "name": name,
+                    "description": description,
+                }
+            )
+            continue
+
+        fname = write_module_file(name, valid_code)
+        print(f"[agent] module planifié ajouté: {fname}")
+        append_history(
+            {
+                "event": "planner_request_consumed",
+                "name": name,
+                "file": fname,
+            }
+        )
+
+        processed = True
+
+        # Rafraîchir le contexte pour les requêtes suivantes
+        manifest = build_manifest()
+        hist_list = read_history_tail(30)
+        hist_txt = build_history_text(hist_list)
+
+    planner["modules_to_create"] = []
+    return processed
+
+
 def _extract_module_metadata(path: str) -> Dict[str, Any]:
     meta: Dict[str, Any] = {
         "summary": "",
@@ -765,6 +895,7 @@ def validate_module_code(code: str) -> Optional[str]:
             "get_history": probe_ctx["get_history"],
         }
     )
+    local_capability_descriptions = dict(_CAPABILITY_DESCRIPTIONS)
 
     def _stub_register_capability(name: str, fn: Any, description: Optional[str] = None) -> None:
         if not name or not fn:
@@ -778,7 +909,11 @@ def validate_module_code(code: str) -> Optional[str]:
         if safe_name in catalog and catalog[safe_name].get("fn") is fn:
             return
 
-        effective_description = description or _CAPABILITY_DESCRIPTIONS.get(safe_name, "outil interne")
+        effective_description = description or local_capability_descriptions.get(
+            safe_name, "outil interne"
+        )
+        if description:
+            local_capability_descriptions[safe_name] = description
         catalog[safe_name] = ProbeDict({"fn": fn, "description": effective_description})
         probe_ctx.setdefault("registered_capabilities", []).append(
             {"name": safe_name, "description": effective_description}
@@ -1282,6 +1417,12 @@ def main() -> None:
         base_dir=BASE_DIR,
         mem_dir=MEM_DIR,
         modules_dir=MODULES_DIR,
+        history=[],
+        tickers=[],
+        planner=ProbeDict({"modules_to_create": []}),
+        manifest=[],
+        modules=[],
+        suggestions=[],
     )
 
     # on expose les outils du noyau AUX modules
@@ -1307,17 +1448,31 @@ def main() -> None:
             # les tickers sont reconstruits à chaque itération
             ctx["tickers"] = []
 
+            planner_ctx = ctx.setdefault("planner", ProbeDict())
+            if isinstance(planner_ctx, ProbeDict):
+                planner_ctx.setdefault("modules_to_create", [])
+
             loaded = load_all_modules(ctx)
             append_history({"event": "modules_loaded", "modules": loaded})
 
             # on laisse les modules jouer
             run_tickers(ctx)
 
+            # Consommer d'abord les modules demandés par les planificateurs
+            if process_planner_requests(ctx):
+                time.sleep(2)
+                continue
+
             # noyau lui-même peut aussi demander au LLM d'ajouter un module
             manifest = build_manifest()
             hist_list = read_history_tail(30)
             hist_txt = build_history_text(hist_list)
             quick_summary = build_quick_summary(manifest, hist_list)
+
+            ctx["manifest"] = manifest
+            ctx["modules"] = [entry.get("name") for entry in manifest if entry.get("name")]
+            ctx["history"] = hist_list
+            ctx.setdefault("suggestions", [])
 
             capabilities_block = build_capabilities_block(ctx.get("capabilities"))
             decision = ask_llm_for_next_step(
